@@ -10,6 +10,7 @@ describe() {
 }
 
 say() { [ "$VERBOSE" ] && echo "$@"; }
+print() { [[ "$AS_STRING" = "string" ]] && echo -n "$@ " || echo "$@"; }
 verbose() { say "$@"; "$@"; }
 die() { echo "$@" >&2; exit 1; }
 
@@ -19,17 +20,26 @@ BLUA_PREFIX=Blua_
 BBIN_PREFIX=Bbin_
 
 # note: only the mingw linker is smart to ommit dlibs that are not used.
-DLIBS_mingw="gdi32 msimg32 opengl32 winmm ws2_32 ole32"
+DLIBS_mingw="crypt32 gdi32 msimg32 opengl32 winmm ws2_32 ole32 psapi mpr"
 DLIBS_linux="m dl"
 DLIBS_osx=
-FRAMEWORKS="ApplicationServices" # for OSX
+FRAMEWORKS="ApplicationServices CoreFoundation Security" # for OSX
 
 APREFIX_mingw=
 APREFIX_linux=lib
 APREFIX_osx=lib
 
-ALIBS="luajit"
+AR=ar
+CC=gcc
+CXX=g++
+STRIP=strip
+CROSS=
+ALIBS=""
 MODULES="bundle_loader"
+LUAJIT_LIB="luajit"
+OUT_LIBRARY="libluab.a"
+LUA_STATIC_LIBRARY="libluasrc.a"
+BUNDLE_STATIC_LIBRARY="libbundle.a"
 BIN_MODULES=
 DIR_MODULES=
 ICON_mingw=media/icons/luapower.ico
@@ -39,7 +49,9 @@ OSX_ICON_SIZES="16 32 128" # you can add 256 and 512 but the icns will be 0.5M
 IGNORE_ODIR=
 COMPRESS_EXE=
 NOCONSOLE=
+TODLL=
 VERBOSE=
+AS_STRING=
 
 # list modules and libs ------------------------------------------------------
 
@@ -51,8 +63,9 @@ lua_module() {
 	[ "$ext" != lua -a "$ext" != dasl ] && return
 	[ "${f%_test.lua}" != $f ] && return
 	[ "${f%_demo.lua}" != $f ] && return
-	[ "${f#bin/}" != $f -a "${f#bin/$P/}" = $f ] && return
-	echo $f
+    [ "${f#bin/}" != $f ] && return
+    [ "bundle_loader.lua" == $f ] && return
+    print $f
 }
 
 # usage: P=<platform> $0 [dir] -> module1.lua|.dasl ...
@@ -76,8 +89,11 @@ lua_modules() {
 alibs() {
 	(cd bin/$P &&
 		for f in *.a; do
-			local m=${f%*.*}   # libz.* -> libz
-			echo ${m#$APREFIX} # libz -> z
+			local m=${f%*.*}      # libz.* -> libz
+			local l=${m#$APREFIX} # libz -> z
+			[ "luajit" == $l ] && continue
+			[ "stdc++" == $l ] && continue
+			print $l
 		done)
 }
 
@@ -100,17 +116,17 @@ compile_bin_file() {
 			.incbin \"$f\"
 		label_2:
 			$shim
-	" | gcc -c -xassembler - -o $o $CFLAGS "$@"
+	" | ${CC} -fPIC -c -xassembler - -o $o ${CFLAGS} "$@"
 }
 
 # usage: CFLAGS=... f=file.c o=file.o $0 CFLAGS... -> file.o
 compile_c_module() {
-	gcc -c -xc $f -o $o $CFLAGS "$@"
+	${CC} -fPIC -c -xc $f -o $o $CFLAGS "$@"
 }
 
 # usage: [ filename=file.lua ] f=file.lua|- o=file.o $0 CFLAGS... -> file.o
 compile_lua_module() {
-	./luajit -b -t raw -g $f $o.luac
+	./bin/$PO/luajit -b -t raw -g $f $o.luac
 	local sym=$filename
 	[ "$sym" ] || sym=$f
 	sym=${sym#bin/$P/lua/}       # bin/<platform>/lua/a.lua -> a.lua
@@ -122,7 +138,7 @@ compile_lua_module() {
 
 # usage: f=file.dasl o=file.o $0 CFLAGS... -> file.o
 compile_dasl_module() {
-	./luajit dynasm.lua $f | filename=$f f=- compile_lua_module "$@"
+	./bin/$PO/luajit dynasm.lua $f | filename=$f f=- compile_lua_module "$@"
 }
 
 # usage: f=file.* [name=file.*] o=file.o $0 CFLAGS... -> file.o
@@ -173,6 +189,14 @@ compile_module() {
 
 	local o=$ODIR/$f$osuffix.o   # a.ext -> $ODIR/a.ext.o
 	OFILES="$OFILES $o"  # add the .o file to the list of files to be linked
+	# add the .o file to the list of files to be linked
+    [[ "$x" == "lua" || "$x" == "dasl" ]] &&
+        OLFILES="$OLFILES $o"
+    # exclude the bundle.c file because it'll be linked to single library
+    [[ "$x" != "lua" && "$x" != "dasl" && "$(basename "$f")" != "bundle.c" ]] &&
+        OFILES="$OFILES $o"
+    [[ "$(basename "$f")" == "bundle.c" ]] &&
+        OBFILES="$OBFILES $o"
 
 	# use the cached .o file if the source file hasn't changed, make-style.
 	[ -z "$IGNORE_ODIR" -a -f $o -a $o -nt $f ] && return
@@ -198,7 +222,7 @@ compile_resource() {
 
 	sayt res $o
 	mkdir -p `dirname $o`
-	echo "$s" | windres -o $o
+	echo "$s" | ${CROSS}windres -o $o
 }
 
 # add an icon file for the exe file and main window (Windows only)
@@ -235,7 +259,7 @@ compile_version_info() {
 	[ $OS = mingw ] || return
 	sayt versioninfo "$VERSIONINFO"
 	s="$(echo '
-	1 VERSIONINFO'
+	2 VERSIONINFO'
 	if [ "${#FILEVERSION}" = 7 ]; then
 		echo "
 		FILEVERSION ${FILEVERSION//./,}
@@ -264,7 +288,7 @@ compile_version_info() {
 compile_virtual_lua_module() {
 	local o=$ODIR/$1.lua.o
 	sayt vlua $1
-	OFILES="$OFILES $o"
+	OLFILES="$OLFILES $o"
 	mkdir -p `dirname $o`
 	echo "$s" | o=$o filename=$1.lua f=- compile_lua_module
 }
@@ -279,6 +303,18 @@ compile_bundle_appversion() {
 	s="return '$APPVERSION'" compile_virtual_lua_module bundle_appversion
 }
 
+compile_lua_static_lib() {
+    [ "$OLFILES" ] || return
+    [ "$ODIR/$LUA_STATIC_LIBRARY" ] && rm $ODIR/$LUA_STATIC_LIBRARY
+    [ "$ODIR" ] && verbose ${AR} rcs $ODIR/$LUA_STATIC_LIBRARY $OLFILES
+}
+
+compile_bundle_static_lib() {
+    [ "$OBFILES" ] || return
+    [ "$EXE_DIR/$BUNDLE_STATIC_LIBRARY" ] && rm $EXE_DIR/$BUNDLE_STATIC_LIBRARY
+    [ "$ODIR" ] && verbose ${AR} rcs $EXE_DIR/$BUNDLE_STATIC_LIBRARY $OBFILES
+}
+
 # usage: MODULES='mod1 ...' $0 -> $ODIR/*.o
 compile_all() {
 	say "Compiling modules..."
@@ -289,6 +325,12 @@ compile_all() {
 
 	# the compile_*() functions will add the names of all .o files to this var
 	OFILES=
+
+    # the compile_virtual_lua_module() function will add the names of all .o files to this var
+    OLFILES=
+
+    # the compile_bundle_module() function will add the names of all .o files to this var
+    OBFILES=	
 
 	# the icon has to be linked first, believe it!
 	# so we compile it first so that it's added to $OFILES first.
@@ -331,13 +373,58 @@ compile_all() {
 	# generate a VERSIONINFO resource (Windows)
 	compile_version_info "$VERSIONINFO"
 
+	# generate a static LIB with Lua code
+    compile_lua_static_lib
+
+    # generate a static LIB with Bundle code
+    compile_bundle_static_lib
+
 }
 
 # linking --------------------------------------------------------------------
 
-aopt() { for f in $1; do echo "bin/$P/$APREFIX$f.a"; done; }
+aopt() { for f in $1; do echo "addlib bin/$P/$APREFIX$f.a"; done; }
+sopt() { for f in $1; do echo -ne "bin/$P/$APREFIX$f.a "; done; }
 lopt() { for f in $1; do echo "-l$f"; done; }
 fopt() { for f in $1; do echo "-framework $f"; done; }
+
+make_union_static_lib() {
+    rm "$EXE_DIR/$OUT_LIBRARY"
+    if [ $OS = osx ]; then
+        mkdir -p .bundle-tmp/$P/luab
+        cp `sopt "$ALIBS"` "$ODIR/$LUA_STATIC_LIBRARY" .bundle-tmp/$P/luab/
+        pushd .bundle-tmp/$P/luab/
+            for libname in *.a; do
+                local libdir=${libname%.*}
+                mkdir ${libdir}
+                pushd ${libdir}
+                	${AR} x ../${libname}
+                    for objname in *.o; do
+                        cp ${objname} "../${libdir}_${objname}"
+				done
+                popd
+                rm -r ${libdir}
+            done
+            rm *.a
+            say "Build union static library:"
+            ${AR} r "../../../$EXE_DIR/$OUT_LIBRARY" *.o
+            verbose ${CROSS}ranlib "../../../$EXE_DIR/$OUT_LIBRARY"
+        popd
+        rm -r .bundle-tmp/$P/luab
+    else
+        AR_MANIFEST=`
+            echo "create $EXE_DIR/$OUT_LIBRARY" &&
+            aopt "$ALIBS" &&
+            echo "addlib $ODIR/$LUA_STATIC_LIBRARY" &&
+            echo "save" &&
+            echo "end"`
+        say "Manifest for union static library:"
+        say "$AR_MANIFEST"
+        ${AR} -M <<EOM
+$AR_MANIFEST
+EOM
+    fi
+}
 
 # usage: LDFLAGS=... P=platform ALIBS='lib1 ...' DLIBS='lib1 ...' \
 #          EXE=exe_file NOCONSOLE=1 $0
@@ -354,49 +441,71 @@ link_mingw() {
 	# make a windows app or a console app
 	[ "$NOCONSOLE" ] && xopt="$xopt -mwindows"
 
-	verbose g++ $LDFLAGS $OFILES -o "$EXE" \
+    local dopt
+    # make a dynamic library as a target
+    [ "$TODLL" ] && dopt="-shared"
+
+    verbose ${CC} $LDFLAGS $OFILES -o "$EXE" $dopt \
 		-static -static-libgcc -static-libstdc++ \
 		-Wl,--export-all-symbols \
-		-Wl,--whole-archive `aopt "$ALIBS"` \
+		-Wl,--whole-archive $EXE_DIR/$OUT_LIBRARY \
+		bin/$P/$LUAJIT_LIB.a $EXE_DIR/$BUNDLE_STATIC_LIBRARY \
 		-Wl,--no-whole-archive \
 		-Wl,--allow-multiple-definition \
 		`lopt "$DLIBS"` $xopt
+	${STRIP} "$EXE"
 }
 
 # usage: LDFLAGS=... P=platform ALIBS='lib1 ...' DLIBS='lib1 ...' EXE=exe_file $0
 link_linux() {
-	verbose g++ $LDFLAGS $OFILES -o "$EXE" \
+	local dopt
+    # make a dynamic library as a target
+    [ "$TODLL" ] && dopt="-shared"
+
+    verbose ${CC} $LDFLAGS $OFILES -o "$EXE" $dopt \
 		-static-libgcc -static-libstdc++ \
 		-Wl,-E \
 		-Lbin/$P \
 		-pthread \
-		-Wl,--whole-archive `aopt "$ALIBS"` \
+		-Wl,--whole-archive $EXE_DIR/$OUT_LIBRARY \
+		bin/$P/lib$LUAJIT_LIB.a $EXE_DIR/$BUNDLE_STATIC_LIBRARY \
 		-Wl,--no-whole-archive `lopt "$DLIBS"` \
 		-Wl,--allow-multiple-definition \
 		-Wl,-rpath,'\$\$ORIGIN'
 	chmod +x "$EXE"
+	${STRIP} "$EXE"
 }
 
 # usage: LDFLAGS=... P=platform ALIBS='lib1 ...' DLIBS='lib1 ...' EXE=exe_file $0
 link_osx() {
 	# note: luajit needs these flags for OSX/x64, see http://luajit.org/install.html#embed
-	local xopt; [ $P = osx64 ] && xopt="-pagezero_size 10000 -image_base 100000000"
+	local xopt
+    [ $P = osx64 -a -z "$TODLL" ] && xopt="-pagezero_size 10000 -image_base 100000000"
+    [ $P = osx64 -a "$TODLL" ] && xopt="-image_base 7fff04c4a000"
+
+    local dopt
+    # make a dynamic library as a target
+    [ "$TODLL" ] && dopt="-shared"
+
 	# note: using -stdlib=libstdc++ because in 10.9+, libc++ is the default.
-	verbose g++ $LDFLAGS $OFILES -o "$EXE" \
-		-mmacosx-version-min=10.6 \
-		-stdlib=libstdc++ \
+    verbose ${CC} $LDFLAGS $OFILES -o "$EXE" $dopt \
+        -stdlib=libc++ \
+        -mmacosx-version-min=10.11 \
 		-Lbin/$P \
 		`lopt "$DLIBS"` \
 		`fopt "$FRAMEWORKS"` \
-		-Wl,-all_load `aopt "$ALIBS"` $xopt
+		-Wl,-all_load $EXE_DIR/$OUT_LIBRARY \
+		bin/$P/lib$LUAJIT_LIB.a $EXE_DIR/$BUNDLE_STATIC_LIBRARY $xopt
 	chmod +x "$EXE"
-	install_name_tool -add_rpath @loader_path/ "$EXE"
+	${STRIP} "$EXE"
+	${CROSS}install_name_tool -add_rpath @loader_path/ "$EXE"
 	# make a minimal app bundle if necessary
 	[ "$NOCONSOLE" ] && make_osx_app
 }
 
 link_all() {
 	say "Linking $EXE..."
+	make_union_static_lib
 	link_$OS
 }
 
@@ -459,10 +568,11 @@ compress_exe() {
 }
 
 # usage: P=platform MODULES='mod1 ...' ALIBS='lib1 ...' DLIBS='lib1 ...'
-#         MAIN=module EXE=exe_file NOCONSOLE=1 ICON=icon COMPRESS_EXE=1 $0
+#         MAIN=module EXE=exe_file NOCONSOLE=1 TODLL=1 ICON=icon COMPRESS_EXE=1 $0
 bundle() {
 	say "Bundle parameters:"
 	say "  Platform:       " "$OS ($P)"
+	say "  Platform orig:  " "$PO"
 	say "  Output file:    " "$EXE"
 	say "  Modules:        " $MODULES
 	say "  Static libs:    " $ALIBS
@@ -470,6 +580,7 @@ bundle() {
 	say "  Binary Modules: " $BIN_MODULES
 	say "  Dir Modules:    " $DIR_MODULES
 	say "  Main module:    " $MAIN
+	say "  Compile to dll: " $TODLL
 	say "  Icon:           " $ICON
 	compile_all
 	link_all
@@ -496,6 +607,8 @@ usage() {
 	echo
 	echo "  -M  --main MODULE                  Module to run on start-up"
 	echo
+	echo "  -L  --to-dll                       Compile to dynamic library"
+    echo
 	echo "  -m32                               Compile for 32bit (Windows, OSX)"
 	echo "  -z  --compress                     Compress the executable (needs UPX)"
 	echo "  -w  --no-console                   Hide console (Windows)"
@@ -510,12 +623,15 @@ usage() {
 	echo "  -ll --list-lua-modules             List Lua modules"
 	echo "  -la --list-alibs                   List static libs (.a files)"
 	echo
+	echo "  -lls --list-lua-modules-str        List Lua modules as string"
+    echo "  -las --list-alibs-str              List static libs as string (.a files)"
+    echo
 	echo "  -C  --clean                        Ignore the object cache"
 	echo
 	echo "  -v  --verbose                      Be verbose"
 	echo "  -h  --help                         Show this screen"
 	echo
-   echo " Passing -- clears the list of args for that option, including implicit args."
+    echo " Passing -- clears the list of args for that option, including implicit args."
 	echo
 	echo " [1] .lua, .c and .dasl are compiled, other files are added as blobs."
 	echo
@@ -540,6 +656,8 @@ detect_platform() {
 set_platform() {
 
 	detect_platform
+    [[ "$PO" && -z $# ]] || PO=`.mgit/platform.sh $@`
+    [ "$P" ] || P=`.mgit/platform.sh $@`
 	[ "$P" ] || die "Unable to set platform."
 	[ "$1" ] && P=${P/64/32}
 
@@ -550,6 +668,42 @@ set_platform() {
 
 	[ $P = osx32 ] && { CFLAGS="-arch i386";   LDFLAGS="-arch i386"; }
 	[ $P = osx64 ] && { CFLAGS="-arch x86_64"; LDFLAGS="-arch x86_64"; }
+	[[ $P = linux32 && `uname` = Linux ]] && {
+        CFLAGS="-m32";
+        LDFLAGS="-m32";
+    }
+    [[ $P = mingw32 && `uname` = Linux ]] && {
+        CROSS=i686-w64-mingw32-;
+        AR=${CROSS}ar
+        CC=${CROSS}gcc
+        CXX=${CROSS}g++
+        STRIP=${CROSS}strip
+    }
+    [[ $P = mingw64 && `uname` = Linux ]] && {
+        CROSS=x86_64-w64-mingw32-;
+        AR=${CROSS}ar
+        CC=${CROSS}gcc
+        CXX=${CROSS}g++
+        STRIP=${CROSS}strip
+    }
+	[ $P = osx32 ] && {
+        CFLAGS="-arch i386 -Wno-unused-command-line-argument";
+        LDFLAGS="-arch i386";
+        CROSS=i386-apple-darwin15-;
+        AR=${CROSS}ar
+        CC=${CROSS}clang
+        CXX=${CROSS}clang++
+        STRIP=${CROSS}strip
+    }
+    [ $P = osx64 ] && {
+        CFLAGS="-arch x86_64 -Wno-unused-command-line-argument";
+        LDFLAGS="-arch x86_64";
+        CROSS=x86_64-apple-darwin19-;
+        AR=${CROSS}ar
+        CC=${CROSS}clang
+        CXX=${CROSS}clang++
+        STRIP=${CROSS}strip
+    }
 }
 
 parse_opts() {
@@ -557,7 +711,7 @@ parse_opts() {
 		local opt="$1"; shift
 		case "$opt" in
 			-o  | --output)
-				EXE="$1"; shift;;
+				EXE="$1"; EXE_DIR="$(dirname "$EXE")"; shift;;
 			-m  | --modules)
 				[ "$1" = -- ] && MODULES= || \
 					[ "$1" = --all ] && MODULES="$(lua_modules)" || \
@@ -570,6 +724,8 @@ parse_opts() {
 				DIR_MODULES="$DIR_MODULES $1"; shift;;
 			-M  | --main)
 				MAIN="$1"; shift;;
+			-L  | --to-dll)
+                TODLL=1;;
 			-a  | --alibs)
 				[ "$1" = -- ] && ALIBS= || \
 					[ "$1" = --all ] && ALIBS="$(alibs)" || \
@@ -588,10 +744,14 @@ parse_opts() {
 				lua_modules; exit;;
 			-la | --list-alibs)
 				alibs; exit;;
+			-lls | --list-lua-modules-str)
+                AS_STRING="string"; lua_modules; exit;;
+            -las | --list-alibs-str)
+                AS_STRING="string"; alibs; exit;;
 			-C  | --clean)
 				IGNORE_ODIR=1;;
 			-m32)
-				set_platform m32;;
+				set_platform -32;;
 			-z  | --compress)
 				COMPRESS_EXE=1;;
 			-i  | --icon)
